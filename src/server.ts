@@ -1,7 +1,7 @@
 import { drizzle } from 'drizzle-orm/mysql2'
 import mysql from 'mysql2/promise'
 import config from 'reactord-schema/config'
-import schema from 'reactord-schema'
+import * as schema from 'reactord-schema/schema'
 import { eq } from 'drizzle-orm'
 import type {
   BiggerReactorsReactorData,
@@ -9,7 +9,7 @@ import type {
   Req,
 } from 'reactord-schema/types/reactord'
 
-const connection = await mysql.createConnection(config)
+const connection = mysql.createPool(config)
 
 const db = drizzle(connection, { mode: 'default', schema })
 
@@ -43,31 +43,65 @@ const defaultBiggerReactor: BiggerReactorsReactorData = {
   transitionedLastTick: 0,
   type: 'none',
   wasteCapacity: 0,
+  controlRodData: null,
 }
 
 const server = Bun.serve<Req>({
   async fetch(req, server) {
-    const type = req.headers.get('type')
-    const deviceId = req.headers.get('deviceId')
-    const token = req.headers.get('token')
+    // const type = req.headers.get('type')
+    // const deviceId = req.headers.get('deviceId')
+    // const token = req.headers.get('token')
 
-    if (!type) {
-      console.debug('header type is required')
-      return new Response('header type is required')
+    // if (!type) {
+    //   console.debug('header type is required')
+    //   return new Response('header type is required')
+    // }
+
+    // if (!token && !deviceId) {
+    //   console.debug('device id is required')
+    //   return new Response('device id is required')
+    // }
+
+    // if (!devices.find((e) => e.includes(type))) {
+    //   console.debug('device type not found')
+    //   return new Response('device type not found')
+    // }
+
+    const header_data = req.url.split('/').slice(-1)[0]
+
+    console.log(header_data)
+
+    if (!header_data) {
+      console.error('query params not found')
+      return new Response('query params not found')
     }
 
-    if (!token && !deviceId) {
-      console.debug('device id is required')
-      return new Response('device id is required')
+    const parsed = header_data.split('-')
+
+    const query_params = new URLSearchParams(req.url.split('?')[1])
+
+    console.log(query_params.get('token'))
+
+    const token = req.headers.get('token') ?? query_params.get('token')
+
+    if (!token && parsed.length < 2) {
+      console.error('There was an error parsing query params (too short)')
+      return new Response('There was an error parsing query params (too short)')
     }
 
-    if (!devices.find((e) => e.includes(type))) {
-      console.debug('device type not found')
-      return new Response('device type not found')
+    let deviceId = undefined
+
+    const type = parsed[0].split('?')[0]
+
+    if (!token) {
+      try {
+        deviceId = parseInt(parsed[1])
+      } catch (e) {
+        console.warn(e)
+      }
     }
 
-    if (token) {
-      console.log(token)
+    if (parsed && token) {
       if (type === 'BiggerReactors_Reactor') {
         const reactor = await db.query.biggerReactors.findFirst({
           where: eq(schema.biggerReactors.access_token, token),
@@ -81,6 +115,10 @@ const server = Bun.serve<Req>({
           return new Response(`${type} #${deviceId} not found`)
         }
 
+        deviceId = reactor.deviceId
+
+        console.log(deviceId)
+
         await db
           .update(schema.devices)
           .set({
@@ -91,6 +129,10 @@ const server = Bun.serve<Req>({
       }
     }
 
+    const dc = query_params.get('dc')
+
+    console.log(`token: ${token}, deviceId: ${deviceId}, type: ${type}`)
+
     const url = new URL(req.url)
 
     console.log(url)
@@ -100,6 +142,7 @@ const server = Bun.serve<Req>({
         token,
         deviceId,
         type,
+        dc,
       },
     })
 
@@ -139,6 +182,23 @@ const server = Bun.serve<Req>({
 
       ws.publish(`${ws.data.type}-${ws.data.id}`, `${message}`)
 
+      if (data.data.device) return
+
+      const reactorData = await db.query.biggerReactors.findFirst({
+        where: eq(schema.biggerReactors.access_token, ws.data.token),
+      })
+
+      if (!reactorData) {
+        console.error('na')
+        ws.close()
+        return
+      }
+
+      data.data.controlRodData = {
+        ...reactorData.controlRodData,
+        ...data.data.controlRodData,
+      }
+
       // now store the values
       await db
         .update(schema.biggerReactors)
@@ -153,7 +213,10 @@ const server = Bun.serve<Req>({
       //await doQuery(ws)
       if (ws.data.type === 'BiggerReactors_Reactor') {
         const reactor = await db.query.biggerReactors.findFirst({
-          where: eq(schema.biggerReactors.access_token, ws.data.token!),
+          where: eq(
+            schema.biggerReactors.access_token,
+            ws.data.token as string,
+          ),
           with: {
             device: true,
           },
@@ -165,23 +228,32 @@ const server = Bun.serve<Req>({
           return
         }
 
-        await db
-          .update(schema.devices)
-          .set({
-            connected: false,
-          })
-          .where(eq(schema.devices.id, reactor.deviceId))
+        if (!ws.data.dc) {
+          console.log('closing!')
+          ws.publish(
+            `${ws.data.type}-${ws.data.id}`,
+            JSON.stringify(defaultBiggerReactor),
+          )
 
-        await db
-          .update(schema.biggerReactors)
-          .set(defaultBiggerReactor)
-          .where(eq(schema.biggerReactors.access_token, ws.data.token!))
+          await db
+            .update(schema.devices)
+            .set({
+              connected: false,
+            })
+            .where(eq(schema.devices.id, reactor.deviceId))
+
+          await db
+            .update(schema.biggerReactors)
+            .set(defaultBiggerReactor)
+            .where(eq(schema.biggerReactors.access_token, ws.data.token!))
+        }
       }
 
       ws.unsubscribe(`${ws.data.type}-${ws.data.id}`)
     },
   },
   hostname: '0.0.0.0',
+  port: 8080,
 })
 
 console.log(`Listening on ${server.hostname}:${server.port}`)
